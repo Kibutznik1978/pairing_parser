@@ -39,41 +39,56 @@ def parse_pairings(pdf_path: Path):
     for page in reader.pages:
         all_text += page.extract_text() + "\n"
 
-    # Each trip starts with "Trip" or "ID" depending on format
+    # Split trips (each trip starts with "Trip Id" or "Trip")
     trips = []
     current_trip = []
     for line in all_text.splitlines():
-        if re.match(r"^\s*Trip\s+\d+", line) or re.match(r"^\s*\d+\s+\(", line):
+        if re.match(r"^\s*Trip\s*Id", line, re.IGNORECASE):
             if current_trip:
-                trips.append(current_trip)
+                trips.append("\n".join(current_trip))
                 current_trip = []
         current_trip.append(line)
     if current_trip:
-        trips.append(current_trip)
+        trips.append("\n".join(current_trip))
 
     return trips
 
 
-def extract_local_times(trip_lines):
+def extract_local_times(trip_text):
     """Return list of local times (HH:MM) for a trip."""
     times = []
     pattern = re.compile(r"\((\d{1,2})\)(\d{2}):(\d{2})")
-    for line in trip_lines:
-        for match in pattern.finditer(line):
-            local_hour = int(match.group(1))
-            minute = int(match.group(3))
-            times.append(f"{local_hour:02d}:{minute:02d}")
+    for match in pattern.finditer(trip_text):
+        local_hour = int(match.group(1))
+        minute = int(match.group(3))
+        times.append(f"{local_hour:02d}:{minute:02d}")
     return times
 
 
-def is_edw_trip(trip_lines):
+def is_edw_trip(trip_text):
     """Flag trip as EDW if any local time between 02:30 and 05:00 inclusive."""
-    times = extract_local_times(trip_lines)
+    times = extract_local_times(trip_text)
     for t in times:
         hh, mm = map(int, t.split(":"))
         if (hh == 2 and mm >= 30) or (hh in [3, 4]) or (hh == 5 and mm == 0):
             return True
     return False
+
+
+def parse_tafb(trip_text):
+    """Extract TAFB in hours from Trip Summary."""
+    m = re.search(r"TAFB:\s*(\d+)h(\d+)", trip_text)
+    if not m:
+        return 0.0
+    hours = int(m.group(1))
+    mins = int(m.group(2))
+    return hours + mins / 60.0
+
+
+def parse_duty_days(trip_text):
+    """Count how many Duty blocks appear in Duty Summary."""
+    duty_blocks = re.findall(r"(?i)Duty\s+\d+h\d+", trip_text)
+    return len(duty_blocks)
 
 
 # -------------------------------------------------------------------
@@ -140,12 +155,17 @@ def run_edw_report(pdf_path: Path, output_dir: Path, domicile: str, aircraft: st
     trips = parse_pairings(pdf_path)
 
     trip_records = []
-    for i, trip_lines in enumerate(trips, start=1):
-        edw_flag = is_edw_trip(trip_lines)
-        trip_length = sum("DUTY" in l or "LEG" in l for l in trip_lines)  # crude estimate
+    for i, trip_text in enumerate(trips, start=1):
+        edw_flag = is_edw_trip(trip_text)
+        tafb_hours = parse_tafb(trip_text)
+        tafb_days = tafb_hours / 24.0 if tafb_hours else 0.0
+        duty_days = parse_duty_days(trip_text)
+
         trip_records.append({
             "Trip ID": i,
-            "Length (days)": trip_length if trip_length > 0 else 1,
+            "TAFB Hours": round(tafb_hours, 2),
+            "TAFB Days": round(tafb_days, 2),
+            "Duty Days": duty_days,
             "EDW": edw_flag,
         })
 
@@ -154,27 +174,38 @@ def run_edw_report(pdf_path: Path, output_dir: Path, domicile: str, aircraft: st
     # Summaries
     total_trips = len(df_trips)
     edw_trips = df_trips["EDW"].sum()
-    pct_edw = edw_trips / total_trips * 100
 
-    trip_summary = pd.DataFrame({
-        "Metric": ["Total Trips", "EDW Trips", "Day Trips", "Pct EDW"],
-        "Value": [total_trips, edw_trips, total_trips - edw_trips, f"{pct_edw:.1f}%"],
-    })
-
-    # Weighted summary (trip-weighted vs length-weighted)
-    trip_weighted = pct_edw
-    length_weighted = df_trips.loc[df_trips["EDW"], "Length (days)"].sum() / df_trips["Length (days)"].sum() * 100
+    trip_weighted = edw_trips / total_trips * 100 if total_trips else 0
+    tafb_weighted = (
+        df_trips.loc[df_trips["EDW"], "TAFB Hours"].sum()
+        / df_trips["TAFB Hours"].sum()
+        * 100
+        if df_trips["TAFB Hours"].sum() > 0 else 0
+    )
+    dutyday_weighted = (
+        df_trips.loc[df_trips["EDW"], "Duty Days"].sum()
+        / df_trips["Duty Days"].sum()
+        * 100
+        if df_trips["Duty Days"].sum() > 0 else 0
+    )
 
     weighted_summary = pd.DataFrame({
-        "Metric": ["Trip-weighted EDW trip %", "Length-weighted EDW trip %"],
-        "Value": [f"{trip_weighted:.1f}%", f"{length_weighted:.1f}%"],
+        "Metric": [
+            "Trip-weighted EDW trip %",
+            "TAFB-weighted EDW trip %",
+            "Duty-day-weighted EDW trip %",
+        ],
+        "Value": [
+            f"{trip_weighted:.1f}%",
+            f"{tafb_weighted:.1f}%",
+            f"{dutyday_weighted:.1f}%",
+        ],
     })
 
     # Save Excel
     excel_path = output_dir / f"{domicile}_{aircraft}_Bid{bid_period}_EDW_Report_Data.xlsx"
     _save_excel({
-        "Trip Summary": df_trips,
-        "Summary Metrics": trip_summary,
+        "Trip Records": df_trips,
         "Weighted Summary": weighted_summary,
     }, excel_path)
 
@@ -188,8 +219,7 @@ def run_edw_report(pdf_path: Path, output_dir: Path, domicile: str, aircraft: st
     _save_pdf(
         f"{domicile} {aircraft} – Bid {bid_period}",
         {
-            "Summary Metrics": trip_summary,
-            "Weighted EDW Summary": weighted_summary,
+            "Weighted Summary": weighted_summary,
         },
         {"Trips by Type": fig},
         pdf_report_path,
@@ -198,8 +228,8 @@ def run_edw_report(pdf_path: Path, output_dir: Path, domicile: str, aircraft: st
     return {
         "excel": excel_path,
         "report_pdf": pdf_report_path,
-        "trip_summary": trip_summary,
         "weighted_summary": weighted_summary,
         "df_trips": df_trips,
     }
+
 
