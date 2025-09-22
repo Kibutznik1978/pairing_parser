@@ -1,8 +1,6 @@
 import tempfile
 from pathlib import Path
 import streamlit as st
-
-# Import your analysis helper
 from edw_reporter import run_edw_report
 
 st.set_page_config(page_title="EDW Pairing Analyzer", layout="centered")
@@ -34,17 +32,17 @@ if run:
         out_dir = tmpdir / "outputs"
         out_dir.mkdir(exist_ok=True)
 
-        results = run_edw_report(
+        res = run_edw_report(
             pdf_path,
             out_dir,
             domicile=dom.strip() or "DOM",
             aircraft=ac.strip() or "AC",
-            bid_period=bid.strip() or "0000"
+            bid_period=bid.strip() or "0000",
         )
 
     st.success("Done! Download your files below:")
 
-    # Excel workbook
+    # Excel
     xlsx = out_dir / f"{dom}_{ac}_Bid{bid}_EDW_Report_Data.xlsx"
     st.download_button(
         "⬇️ Download Excel",
@@ -53,18 +51,17 @@ if run:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    # PDF report
-    pdf_report = results["report_pdf"]
+    # Report PDF
+    report_pdf = res["report_pdf"]
     st.download_button(
         "⬇️ Download PDF report",
-        data=pdf_report.read_bytes(),
-        file_name=pdf_report.name,
+        data=report_pdf.read_bytes(),
+        file_name=report_pdf.name,
         mime="application/pdf",
     )
 
     st.divider()
     st.caption("Raw CSV outputs (optional)")
-
     for fn in [
         "trip_level_edw_flags.csv",
         "trip_length_summary.csv",
@@ -81,6 +78,12 @@ if run:
                 file_name=fp.name,
                 mime="text/csv",
             )
+
+st.caption(
+    "Notes: EDW = any duty day touches 02:30–05:00 local (inclusive). "
+    "Local hour comes from the number in parentheses ( ), minutes from the following Z time."
+)
+
 
 st.caption(
     "Notes: EDW = any duty day touches 02:30–05:00 local (inclusive). "
