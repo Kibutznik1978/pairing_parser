@@ -4,3 +4,4 @@ matplotlib
 reportlab
 pillow
 PyPDF2
+openpyxl
