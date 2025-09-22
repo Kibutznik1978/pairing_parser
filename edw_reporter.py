@@ -1,9 +1,9 @@
 import re
 import unicodedata
 from pathlib import Path
+from io import BytesIO
 import pandas as pd
 import matplotlib.pyplot as plt
-from io import BytesIO
 from PIL import Image as PILImage
 
 from PyPDF2 import PdfReader
@@ -23,18 +23,58 @@ from reportlab.lib.styles import getSampleStyleSheet
 # Text Sanitizer
 # -------------------------------------------------------------------
 def clean_text(text: str) -> str:
-    """
-    Normalize text so ReportLab doesn't render black boxes (■).
-    - Normalize Unicode (smart quotes → plain quotes, em-dash → hyphen, etc.)
-    - Replace non-breaking spaces with regular spaces
-    - Replace bullets/black squares with plain dashes
-    """
     if not isinstance(text, str):
         return text
     text = unicodedata.normalize("NFKC", text)
-    text = text.replace("\u00A0", " ")  # non-breaking space → space
-    text = re.sub(r"[■•▪●]", "-", text)  # any bullets/boxes → dash
+    text = text.replace("\u00A0", " ")
+    text = re.sub(r"[■•▪●]", "-", text)
     return text
+
+# -------------------------------------------------------------------
+# PDF Parsing & EDW Logic
+# -------------------------------------------------------------------
+def parse_pairings(pdf_path: Path):
+    reader = PdfReader(str(pdf_path))
+    all_text = ""
+    for page in reader.pages:
+        all_text += page.extract_text() + "\n"
+
+    # Each trip starts with "Trip" or "ID" depending on format
+    trips = []
+    current_trip = []
+    for line in all_text.splitlines():
+        if re.match(r"^\s*Trip\s+\d+", line) or re.match(r"^\s*\d+\s+\(", line):
+            if current_trip:
+                trips.append(current_trip)
+                current_trip = []
+        current_trip.append(line)
+    if current_trip:
+        trips.append(current_trip)
+
+    return trips
+
+
+def extract_local_times(trip_lines):
+    """Return list of local times (HH:MM) for a trip."""
+    times = []
+    pattern = re.compile(r"\((\d{1,2})\)(\d{2}):(\d{2})")
+    for line in trip_lines:
+        for match in pattern.finditer(line):
+            local_hour = int(match.group(1))
+            minute = int(match.group(3))
+            times.append(f"{local_hour:02d}:{minute:02d}")
+    return times
+
+
+def is_edw_trip(trip_lines):
+    """Flag trip as EDW if any local time between 02:30 and 05:00 inclusive."""
+    times = extract_local_times(trip_lines)
+    for t in times:
+        hh, mm = map(int, t.split(":"))
+        if (hh == 2 and mm >= 30) or (hh in [3, 4]) or (hh == 5 and mm == 0):
+            return True
+    return False
+
 
 # -------------------------------------------------------------------
 # PDF Utilities
@@ -43,17 +83,14 @@ def _save_pdf(title, tables, charts, output_path: Path):
     styles = getSampleStyleSheet()
     story = []
 
-    # Title
     story.append(Paragraph(clean_text(title), styles["Title"]))
     story.append(Spacer(1, 12))
 
-    # Add tables
     for caption, df in tables.items():
         story.append(Paragraph(clean_text(caption), styles["Heading2"]))
         story.append(Spacer(1, 6))
 
         data = [list(df.columns)] + df.values.tolist()
-        # clean text inside table
         data = [[clean_text(cell) for cell in row] for row in data]
 
         t = Table(data)
@@ -72,7 +109,6 @@ def _save_pdf(title, tables, charts, output_path: Path):
         story.append(t)
         story.append(Spacer(1, 12))
 
-    # Add charts
     for caption, fig in charts.items():
         story.append(Paragraph(clean_text(caption), styles["Heading2"]))
         buf = BytesIO()
@@ -87,6 +123,7 @@ def _save_pdf(title, tables, charts, output_path: Path):
     doc = SimpleDocTemplate(str(output_path), pagesize=letter)
     doc.build(story)
 
+
 # -------------------------------------------------------------------
 # Excel Utilities
 # -------------------------------------------------------------------
@@ -95,45 +132,65 @@ def _save_excel(dfs: dict, output_path: Path):
         for sheet, df in dfs.items():
             df.to_excel(writer, sheet_name=clean_text(sheet), index=False)
 
+
 # -------------------------------------------------------------------
 # Main Reporting
 # -------------------------------------------------------------------
 def run_edw_report(pdf_path: Path, output_dir: Path, domicile: str, aircraft: str, bid_period: str):
-    """
-    Parse a pairings PDF, classify EDW vs Day trips, generate summaries,
-    and export Excel + PDF reports.
-    """
+    trips = parse_pairings(pdf_path)
 
-    # Dummy placeholders for parsed data (replace with your real parsing logic)
+    trip_records = []
+    for i, trip_lines in enumerate(trips, start=1):
+        edw_flag = is_edw_trip(trip_lines)
+        trip_length = sum("DUTY" in l or "LEG" in l for l in trip_lines)  # crude estimate
+        trip_records.append({
+            "Trip ID": i,
+            "Length (days)": trip_length if trip_length > 0 else 1,
+            "EDW": edw_flag,
+        })
+
+    df_trips = pd.DataFrame(trip_records)
+
+    # Summaries
+    total_trips = len(df_trips)
+    edw_trips = df_trips["EDW"].sum()
+    pct_edw = edw_trips / total_trips * 100
+
     trip_summary = pd.DataFrame({
-        "Trip ID": [1, 2, 3],
-        "Type": ["Day", "EDW", "EDW"],
-        "Length": [1, 4, 6],
+        "Metric": ["Total Trips", "EDW Trips", "Day Trips", "Pct EDW"],
+        "Value": [total_trips, edw_trips, total_trips - edw_trips, f"{pct_edw:.1f}%"],
     })
 
+    # Weighted summary (trip-weighted vs length-weighted)
+    trip_weighted = pct_edw
+    length_weighted = df_trips.loc[df_trips["EDW"], "Length (days)"].sum() / df_trips["Length (days)"].sum() * 100
+
     weighted_summary = pd.DataFrame({
-        "Metric": ["Trip-weighted EDW trip %", "Length-weighted EDW trip %", "Duty-day-weighted EDW day %"],
-        "Value": ["65.6%", "77.4%", "47.0%"],
+        "Metric": ["Trip-weighted EDW trip %", "Length-weighted EDW trip %"],
+        "Value": [f"{trip_weighted:.1f}%", f"{length_weighted:.1f}%"],
     })
 
     # Save Excel
     excel_path = output_dir / f"{domicile}_{aircraft}_Bid{bid_period}_EDW_Report_Data.xlsx"
     _save_excel({
-        "Trip Summary": trip_summary,
+        "Trip Summary": df_trips,
+        "Summary Metrics": trip_summary,
         "Weighted Summary": weighted_summary,
     }, excel_path)
 
     # Save PDF
     pdf_report_path = output_dir / f"{domicile}_{aircraft}_Bid{bid_period}_EDW_Report.pdf"
 
-    # Example chart
     fig, ax = plt.subplots()
-    trip_summary["Type"].value_counts().plot(kind="bar", ax=ax)
+    df_trips["EDW"].value_counts().rename({True: "EDW", False: "Day"}).plot(kind="bar", ax=ax)
     ax.set_title("Trips by Type")
 
     _save_pdf(
         f"{domicile} {aircraft} – Bid {bid_period}",
-        {"Weighted EDW Summary": weighted_summary},
+        {
+            "Summary Metrics": trip_summary,
+            "Weighted EDW Summary": weighted_summary,
+        },
         {"Trips by Type": fig},
         pdf_report_path,
     )
@@ -143,5 +200,6 @@ def run_edw_report(pdf_path: Path, output_dir: Path, domicile: str, aircraft: st
         "report_pdf": pdf_report_path,
         "trip_summary": trip_summary,
         "weighted_summary": weighted_summary,
+        "df_trips": df_trips,
     }
 
